@@ -1,0 +1,10 @@
+# FeedbackLens
+# https://feedbacklens.com
+
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /auth
+Disallow: /analyzing
+
+Sitemap: https://feedbacklens.com/sitemap.xml
