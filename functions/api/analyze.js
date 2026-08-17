@@ -3,10 +3,11 @@
  *
  * FeedbackLens 三步 AI 分析引擎 — EdgeOne 边缘节点版本
  *
- * AI 调用优先级：
- * 1. EdgeOne 内置边缘 AI（@makers/deepseek-v4-flash）— 免费、超低延迟
- * 2. 外部 DeepSeek API（需要 DEEPSEEK_API_KEY 环境变量）
- * 3. Mock 模式（无 API Key 时自动降级）
+ * AI 调用优先级（两套 edge-ai + 一套外部 + mock）：
+ * 1. Makers 模型网关（@makers/deepseek-v4-flash，需 MAKERS_MODELS_KEY）— 统一接入，OpenAI 协议
+ * 2. EdgeOne 边缘内置 AI（@tx/deepseek-ai/deepseek-v4，免 Key 免费 Beta）
+ * 3. 外部 DeepSeek API（需要 DEEPSEEK_API_KEY 环境变量）
+ * 4. Mock 模式（兜底）
  *
  * 三步分析流程：
  * Step 1: 聚类 — 将所有反馈按主题分组
@@ -213,42 +214,171 @@ function safeJsonParse(text) {
 
 // ============ AI 调用层 ============
 
+// 判断是否为流式响应（ReadableStream）
+function isStream(resp) {
+  return resp && typeof resp.getReader === "function";
+}
+
+// 从流式/非流式响应中提取文本内容
+async function extractContent(resp) {
+  if (typeof resp === "string") return resp;
+  if (isStream(resp)) return await readSSE(resp);
+  if (resp && resp.choices) {
+    return (resp.choices[0] && (resp.choices[0].message && resp.choices[0].message.content)) || "";
+  }
+  if (resp && resp.content) return resp.content;
+  return "";
+}
+
+// 解析 SSE（Server-Sent Events）流，拼接 delta.content
+async function readSSE(stream) {
+  var reader = stream.getReader();
+  var decoder = new TextDecoder();
+  var content = "";
+  var buffer = "";
+  try {
+    while (true) {
+      var r = await reader.read();
+      if (r.done) break;
+      buffer += decoder.decode(r.value, { stream: true });
+      var parts = buffer.split("\n");
+      buffer = parts.pop() || "";
+      for (var i = 0; i < parts.length; i++) {
+        var line = parts[i].trim();
+        if (line.indexOf("data:") !== 0) continue;
+        var data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+        try {
+          var json = JSON.parse(data);
+          var choice = json.choices && json.choices[0] ? json.choices[0] : null;
+          if (!choice) continue;
+          var c = (choice.delta && choice.delta.content) || (choice.message && choice.message.content) || "";
+          content += c;
+        } catch (e) {
+          // 跳过非 JSON 行（如注释行）
+        }
+      }
+    }
+  } catch (e) {
+    // 读取中断时返回已累积内容
+  }
+  return content;
+}
+
+/**
+ * Makers Models 模型网关（EdgeOne Makers 统一模型访问服务）
+ *
+ * 兼容 OpenAI 协议，模型 ID 形如 @makers/deepseek-v4-flash
+ * 端点：https://ai-gateway.edgeone.link/v1/chat/completions
+ * 需要环境变量 MAKERS_MODELS_KEY（在 Makers 控制台免费创建）
+ */
+async function callMakersGateway(messages, options, env) {
+  var key = env.MAKERS_MODELS_KEY;
+  if (!key) return null; // 未配置则跳过，交给后面的通道
+
+  var body = {
+    model: "@makers/deepseek-v4-flash",
+    messages: messages,
+    temperature: options.temperature || 0.3,
+    stream: false, // 非流式，直接拿到 JSON + usage
+  };
+  if (options.maxTokens) body.max_tokens = options.maxTokens;
+
+  var resp = await fetch("https://ai-gateway.edgeone.link/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + key,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    var errText = await resp.text();
+    throw new Error("Makers 网关错误 " + resp.status + ": " + errText.slice(0, 200));
+  }
+
+  var data = await resp.json();
+  var content =
+    data.choices && data.choices[0]
+      ? (data.choices[0].message && data.choices[0].message.content) || ""
+      : "";
+  var u = data.usage || {};
+
+  return {
+    content: content,
+    usage: {
+      promptTokens: u.prompt_tokens || 0,
+      completionTokens: u.completion_tokens || 0,
+      totalTokens: u.total_tokens || 0,
+    },
+    cost: 0,
+    source: "edge-ai",
+    model: "@makers/deepseek-v4-flash",
+  };
+}
+
 /**
  * 调用 AI Chat Completion
  *
- * 三级降级策略：
- * 1. EdgeOne 内置 AI（context 中的 AI 对象）
- * 2. 外部 DeepSeek API
- * 3. Mock 模式
+ * 四级降级策略：
+ * 1. Makers 模型网关（MAKERS_MODELS_KEY，@makers/ 模型，OpenAI 协议）
+ * 2. EdgeOne 边缘内置 AI（AI 全局对象，@tx/ 模型，免 Key 免费 Beta）
+ * 3. 外部 DeepSeek API（DEEPSEEK_API_KEY）
+ * 4. Mock 模式
  */
 async function callAI(messages, options, env) {
   var temperature = options.temperature || 0.3;
   var maxTokens = options.maxTokens || 4096;
 
-  // 尝试 EdgeOne 内置 AI
+  // 优先级 1：Makers 模型网关（统一接入，需 MAKERS_MODELS_KEY）
+  if (env.MAKERS_MODELS_KEY) {
+    try {
+      return await callMakersGateway(messages, options, env);
+    } catch (e) {
+      console.warn("Makers 模型网关调用失败，降级到边缘内置 AI:", e && e.message ? e.message : e);
+    }
+  }
+
+  // 优先级 2：EdgeOne 边缘内置 AI（Pages Functions 全局 AI，免 Key 免费 Beta）
   if (typeof AI !== "undefined" && AI.chatCompletions) {
     try {
-      var aiResponse = await AI.chatCompletions({
-        model: "@makers/deepseek-v4-flash",
-        messages: messages,
-        temperature: temperature,
-        max_tokens: maxTokens,
-        stream: false,
-      });
+      // EdgeOne 官方模型 ID（注意命名空间是 @tx/deepseek-ai/，不是 @makers/）
+      var edgeModels = [
+        "@tx/deepseek-ai/deepseek-v4",
+        "@tx/deepseek-ai/deepseek-v3-0324",
+        "@tx/deepseek-ai/deepseek-v32",
+      ];
 
-      // 解析响应
-      var content = "";
-      var usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      var aiResponse = null;
+      var usedModel = null;
+      var modelErr = null;
 
-      if (aiResponse && aiResponse.choices && aiResponse.choices[0]) {
-        content = aiResponse.choices[0].message?.content || "";
-      } else if (typeof aiResponse === "string") {
-        content = aiResponse;
-      } else if (aiResponse && aiResponse.content) {
-        content = aiResponse.content;
+      for (var mi = 0; mi < edgeModels.length; mi++) {
+        try {
+          aiResponse = await AI.chatCompletions({
+            model: edgeModels[mi],
+            messages: messages,
+            temperature: temperature,
+            stream: true, // EdgeOne 官方推荐用流式，返回 SSE
+          });
+          usedModel = edgeModels[mi];
+          break;
+        } catch (e) {
+          modelErr = e;
+          // 尝试下一个模型
+        }
       }
 
-      if (aiResponse && aiResponse.usage) {
+      if (!aiResponse) {
+        throw modelErr || new Error("所有边缘模型均不可用");
+      }
+
+      var content = await extractContent(aiResponse);
+      var usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+
+      // 非流式时可能带 usage；流式一般不含 usage
+      if (!isStream(aiResponse) && aiResponse && aiResponse.usage) {
         usage = {
           promptTokens: aiResponse.usage.prompt_tokens || 0,
           completionTokens: aiResponse.usage.completion_tokens || 0,
@@ -256,9 +386,9 @@ async function callAI(messages, options, env) {
         };
       }
 
-      return { content: content, usage: usage, cost: 0, source: "edge-ai" };
+      return { content: content, usage: usage, cost: 0, source: "edge-ai", model: usedModel };
     } catch (e) {
-      console.warn("EdgeOne 内置 AI 调用失败，降级到外部 API:", e.message);
+      console.warn("EdgeOne 内置 AI 调用失败，降级到外部 API:", e && e.message ? e.message : e);
     }
   }
 
